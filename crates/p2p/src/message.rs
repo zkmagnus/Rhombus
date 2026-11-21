@@ -6,7 +6,7 @@
 use crate::address::{NetAddr, PeerKey};
 use protocol::block::{Block, BlockHash, BlockHeader};
 use protocol::bytes::{Encodable, Reader, Writer};
-use protocol::consensus::MAX_BLOCK_TRANSACTIONS;
+use protocol::consensus::{ACTION_CLASSES, MAX_BLOCK_TRANSACTIONS};
 use protocol::transaction::{Transaction, TxId};
 
 use crate::{Error, Result};
@@ -310,6 +310,20 @@ mod tag {
     pub const SNAPSHOT_CHUNK: u8 = 22;
 }
 
+pub(crate) fn is_transaction_tag(tag: u8) -> bool {
+    matches!(tag, tag::TX | tag::STEM_TX)
+}
+
+/// Rejects an impossible standalone transaction frame before its body is read.
+pub(crate) fn precheck_transaction_frame_len(len: usize) -> Result<()> {
+    for actions in ACTION_CLASSES {
+        if Transaction::encoded_len_for_actions(actions)?.checked_add(1) == Some(len) {
+            return Ok(());
+        }
+    }
+    Err(protocol::Error::Malformed("transaction length does not match action count").into())
+}
+
 impl Message {
     /// The type tag.
     pub fn tag(&self) -> u8 {
@@ -511,8 +525,14 @@ impl Message {
                 }
             }
             tag::BLOCK => Self::Block(Box::new(Block::read(&mut r)?)),
-            tag::TX => Self::Tx(Box::new(Transaction::read(&mut r)?)),
-            tag::STEM_TX => Self::StemTx(Box::new(Transaction::read(&mut r)?)),
+            tag::TX | tag::STEM_TX => {
+                let transaction = Box::new(Transaction::from_slice(r.take(r.remaining())?)?);
+                if tag == tag::TX {
+                    Self::Tx(transaction)
+                } else {
+                    Self::StemTx(transaction)
+                }
+            }
             tag::COMPACT_BLOCK => {
                 let header = BlockHeader::read(&mut r)?;
                 let coinbase = Transaction::read(&mut r)?;
@@ -624,12 +644,33 @@ fn read_inventory(r: &mut Reader<'_>) -> Result<Inventory> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crypto::pallas;
     use protocol::block::empty_header;
     use protocol::transaction::Anchor;
 
     use super::*;
+
+    /// Canonical encoding with dummy proof/signatures, not a valid payment.
+    pub(crate) fn sample_transaction(actions: usize) -> Transaction {
+        use crypto::encoding::ENCODED_LEN;
+        use protocol::action::{ACTION_BODY_LEN, ACTION_LEN};
+        use protocol::consensus::{TRANSFER_KIND, TX_VERSION};
+        use protocol::encryption::ENCRYPTED_COIN_VERSION;
+        use protocol::transaction::{ACTION_PROOF_MAGIC, TRANSACTION_HEADER_LEN};
+
+        let mut bytes = vec![0; Transaction::encoded_len_for_actions(actions).unwrap()];
+        bytes[0] = TX_VERSION;
+        bytes[1] = TRANSFER_KIND;
+        bytes[TRANSACTION_HEADER_LEN - 1] = u8::try_from(actions).unwrap();
+        for index in 0..actions {
+            let encrypted_coin = TRANSACTION_HEADER_LEN + index * ACTION_BODY_LEN + 4 * ENCODED_LEN;
+            bytes[encrypted_coin] = ENCRYPTED_COIN_VERSION;
+        }
+        let proof = TRANSACTION_HEADER_LEN + actions * ACTION_LEN;
+        bytes[proof..proof + ACTION_PROOF_MAGIC.len()].copy_from_slice(ACTION_PROOF_MAGIC);
+        Transaction::from_slice(&bytes).unwrap()
+    }
 
     fn samples() -> Vec<Message> {
         let header = empty_header(
@@ -669,14 +710,24 @@ mod tests {
             ]),
             Message::GetData(vec![Inventory::Tx(TxId::from_bytes([8; 32]))]),
             Message::NotFound(vec![]),
-            Message::Block(Box::new(Block::new(header.clone(), Vec::new()))),
+            Message::Block(Box::new(Block::new(
+                header.clone(),
+                vec![sample_transaction(2), sample_transaction(4)],
+            ))),
+            Message::Tx(Box::new(sample_transaction(2))),
+            Message::StemTx(Box::new(sample_transaction(4))),
+            Message::CompactBlock(Box::new(CompactBlock {
+                header,
+                coinbase: sample_transaction(2),
+                txids: vec![TxId::from_bytes([5; 32])],
+            })),
             Message::GetBlockTxn {
                 hash: BlockHash::ZERO,
                 indices: vec![1, 3],
             },
             Message::BlockTxn {
                 hash: BlockHash::ZERO,
-                transactions: vec![],
+                transactions: vec![sample_transaction(2), sample_transaction(4)],
             },
             Message::GetSnapshotManifest { height: 525_600 },
             Message::SnapshotManifest(SnapshotManifestInfo {
@@ -739,6 +790,39 @@ mod tests {
             Err(Error::ListTooLong("inventory"))
         ));
         assert!(Message::decode(&[tag::PING, 1, 2]).is_err(), "truncated");
+    }
+
+    #[test]
+    fn standalone_transaction_sizes_must_match_the_declared_action_count() {
+        use protocol::transaction::TRANSACTION_HEADER_LEN;
+
+        for actions in ACTION_CLASSES {
+            let transaction = sample_transaction(actions);
+            for message in [
+                Message::Tx(Box::new(transaction.clone())),
+                Message::StemTx(Box::new(transaction.clone())),
+            ] {
+                let bytes = message.encode();
+                assert_eq!(Message::decode(&bytes).unwrap(), message);
+                for declared in ACTION_CLASSES {
+                    if declared == actions {
+                        continue;
+                    }
+                    let mut mismatched = bytes.clone();
+                    mismatched[TRANSACTION_HEADER_LEN] = u8::try_from(declared).unwrap();
+                    assert!(matches!(
+                        Message::decode(&mismatched),
+                        Err(Error::Protocol(protocol::Error::Malformed(
+                            "transaction length does not match action count"
+                        )))
+                    ));
+                }
+                let mut long = bytes.clone();
+                long.push(0);
+                assert!(Message::decode(&long).is_err());
+                assert!(Message::decode(&bytes[..bytes.len() - 1]).is_err());
+            }
+        }
     }
 
     #[test]

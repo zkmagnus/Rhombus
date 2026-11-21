@@ -17,14 +17,34 @@ use crate::transaction::Transaction;
 use crate::{Error, Result};
 
 /// Checks shape rules: version, action class, proof length, unique nullifiers,
-/// and the exact encoded-size fee.
+/// and the minimum encoded-size fee.
 ///
 /// # Errors
-/// Returns [`Error::InvalidTransaction`] naming the first violated rule.
+/// Returns [`Error::InvalidTransaction`] naming the first violated rule, or
+/// [`Error::RawCoinOutOfRange`] if the fee cannot fit the binding balance.
 pub fn check_structure(tx: &Transaction) -> Result<()> {
-    check_shape_and_kind(tx, TRANSFER_KIND)?;
+    check_transfer_shape(tx)?;
     tx.check_fee()?;
     Ok(())
+}
+
+/// Checks transfer encoding shape without checking its fee or authorization.
+/// Stateful admission checks anchors and nullifiers after this inexpensive
+/// pass, then checks the fee before verifying signatures and the proof.
+///
+/// # Errors
+/// Returns [`Error::InvalidTransaction`] for a malformed transfer shape.
+pub fn check_transfer_shape(tx: &Transaction) -> Result<()> {
+    check_shape_and_kind(tx, TRANSFER_KIND)
+}
+
+/// Checks coinbase encoding shape without checking its zero-fee rule.
+/// The caller must classify the coinbase by its position in the block.
+///
+/// # Errors
+/// Returns [`Error::InvalidTransaction`] for a malformed coinbase shape.
+pub fn check_coinbase_shape(tx: &Transaction) -> Result<()> {
+    check_shape_and_kind(tx, COINBASE_KIND)
 }
 
 /// Checks the structural shape used by kernel-created coinbases.
@@ -32,7 +52,7 @@ pub fn check_structure(tx: &Transaction) -> Result<()> {
 /// This must only be called after the chain kernel has classified the
 /// transaction as a coinbase and computed its public balance.
 pub fn check_coinbase_structure(tx: &Transaction) -> Result<()> {
-    check_shape_and_kind(tx, COINBASE_KIND)?;
+    check_coinbase_shape(tx)?;
     tx.check_fee()
 }
 
@@ -42,11 +62,6 @@ fn check_shape_and_kind(tx: &Transaction, kind: u8) -> Result<()> {
     }
     if tx.kind() != kind {
         return Err(Error::InvalidTransaction("wrong native transaction kind"));
-    }
-    if tx.action_proof_envelope().is_none() {
-        return Err(Error::InvalidTransaction(
-            "action proof envelope is missing",
-        ));
     }
     if !is_action_class(tx.actions().len()) {
         return Err(Error::InvalidTransaction(
@@ -65,8 +80,8 @@ fn check_shape_and_kind(tx: &Transaction, kind: u8) -> Result<()> {
     Ok(())
 }
 
-/// The public value balance of a coinbase paying `credit` (subsidy plus
-/// the fees paid by transfers): it creates value.
+/// The public value balance of a coinbase paying `credit` (net issuance plus
+/// the fees paid by transfers): it creates value in the coinbase transaction.
 ///
 /// # Errors
 /// If `credit` does not fit an `i64`.
@@ -339,21 +354,27 @@ mod tests {
     }
 
     #[test]
-    fn structure_enforces_exact_fee_and_native_transfer_kind() {
+    fn structure_enforces_minimum_fee_and_native_transfer_kind() {
         let tx = unsigned_tx(41, 2);
         assert!(check_structure(&tx).is_ok());
 
         let mut bytes = tx.to_vec();
         let fee_offset = 1 + 1 + 32;
         let original = tx.fee().raw();
-        bytes[fee_offset..fee_offset + 8].copy_from_slice(&(original + 1).to_le_bytes());
+        bytes[fee_offset..fee_offset + 8].copy_from_slice(&(original - 1).to_le_bytes());
         let wrong_fee = Transaction::from_slice(&bytes).unwrap();
+        assert!(check_transfer_shape(&wrong_fee).is_ok());
         assert!(matches!(
             check_structure(&wrong_fee),
             Err(Error::InvalidTransaction(
-                "fee does not match transaction size"
+                "fee is below transaction minimum"
             ))
         ));
+
+        let mut bytes = tx.to_vec();
+        bytes[fee_offset..fee_offset + 8].copy_from_slice(&(original + 1).to_le_bytes());
+        let above_minimum = Transaction::from_slice(&bytes).unwrap();
+        assert!(check_structure(&above_minimum).is_ok());
 
         let mut bytes = tx.to_vec();
         bytes[1] = COINBASE_KIND;
@@ -375,9 +396,7 @@ mod tests {
             assert_eq!(decoded.fee().raw(), fee);
             assert!(matches!(
                 check_structure(&decoded),
-                Err(Error::InvalidTransaction(
-                    "fee does not match transaction size"
-                ))
+                Err(Error::RawCoinOutOfRange)
             ));
         }
     }

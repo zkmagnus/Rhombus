@@ -13,8 +13,13 @@ mod common;
 use chain::mempool::{Mempool, Rejection};
 use chain::params::{ChainParams, Upgrade};
 use chain::Error;
-use common::{proving_key, spend_first_coin, spend_first_coin_for, Harness, Wallet};
-use protocol::consensus::BranchId;
+use common::{
+    proving_key, spend_first_coin, spend_first_coin_for, spend_first_coin_with_fee, Harness, Wallet,
+};
+use protocol::amount::RawCoin;
+use protocol::bytes::Encodable;
+use protocol::consensus::{subsidy, BranchId};
+use protocol::transaction::{Anchor, Transaction, ACTION_PROOF_MAGIC, TRANSACTION_HEADER_LEN};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
@@ -95,6 +100,102 @@ fn conflicting_spends_are_refused() {
         insert(&mut pool, &mut h, b),
         Err(Error::Rejected(Rejection::Conflict))
     ));
+}
+
+#[test]
+fn state_and_fee_checks_precede_signatures_and_proofs_without_reserving_nullifiers() {
+    let (mut h, other) = funded(201);
+    let wallet = h.miner.clone_for_test(0);
+    let valid = spend_first_coin(&mut h, &wallet, &other.address, 1_000);
+    let mut pool = Mempool::new(8);
+
+    let mut bytes = valid.to_vec();
+    let signature_start =
+        TRANSACTION_HEADER_LEN + valid.actions().len() * protocol::action::ACTION_BODY_LEN;
+    let proof_start = TRANSACTION_HEADER_LEN
+        + valid.actions().len() * protocol::action::ACTION_LEN
+        + ACTION_PROOF_MAGIC.len();
+    let proof_end = proof_start + valid.proof().as_bytes().len();
+    // The encoding remains well formed; both expensive verification stages fail.
+    bytes[signature_start..proof_start - ACTION_PROOF_MAGIC.len()].fill(0);
+    bytes[proof_start..proof_end].fill(0);
+    let bad_authorization = Transaction::from_slice(&bytes).unwrap();
+    assert!(matches!(
+        insert(&mut pool, &mut h, bad_authorization.clone()),
+        Err(Error::Protocol(protocol::Error::Crypto(
+            crypto::Error::InvalidSignature
+        )))
+    ));
+    assert!(pool.is_empty());
+
+    // Fee is part of effecting data, so this also leaves invalid signatures.
+    bytes[34..42].copy_from_slice(&0u64.to_le_bytes());
+    let underpaid = Transaction::from_slice(&bytes).unwrap();
+    assert!(matches!(
+        insert(&mut pool, &mut h, underpaid.clone()),
+        Err(Error::Protocol(protocol::Error::InvalidTransaction(
+            "fee is below transaction minimum"
+        )))
+    ));
+    assert!(pool.is_empty());
+
+    let unknown = Anchor::from_base(crypto::pallas::Base::from(u64::MAX));
+    assert!(h
+        .chain
+        .store()
+        .anchor_height(&unknown, h.chain.params().anchor_max_age)
+        .unwrap()
+        .is_none());
+    let mut stale = underpaid.to_vec();
+    stale[2..34].copy_from_slice(&unknown.to_bytes());
+    assert!(matches!(
+        insert(&mut pool, &mut h, Transaction::from_slice(&stale).unwrap()),
+        Err(Error::Rejected(Rejection::StaleAnchor))
+    ));
+    assert!(pool.is_empty());
+
+    // Rejected transactions never reserve their nullifiers: the original fits.
+    insert(&mut pool, &mut h, valid.clone()).unwrap();
+    assert_eq!(pool.len(), 1);
+    assert!(matches!(
+        insert(&mut pool, &mut h, underpaid.clone()),
+        Err(Error::Rejected(Rejection::Conflict))
+    ));
+    assert_eq!(pool.len(), 1);
+
+    let block = h.extend(vec![valid]);
+    pool.on_block_applied(&block, h.chain.store(), h.chain.params())
+        .unwrap();
+    assert!(matches!(
+        insert(&mut pool, &mut h, underpaid),
+        Err(Error::Rejected(Rejection::SpentNullifier))
+    ));
+    assert!(pool.is_empty());
+}
+
+#[test]
+fn fees_above_the_minimum_are_admitted_selected_and_paid_to_the_miner() {
+    let (mut h, other) = funded(202);
+    let wallet = h.miner.clone_for_test(0);
+    let minimum = Transaction::default_fee_for_actions(2).unwrap().raw();
+    let fee = minimum + 123;
+    let tx = spend_first_coin_with_fee(&mut h, &wallet, &other.address, 1_000, fee);
+    let mut pool = Mempool::new(8);
+    let txid = insert(&mut pool, &mut h, tx).unwrap();
+    let selected = pool.select(h.chain.store(), h.chain.params(), 8).unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].txid(), txid);
+    assert_eq!(selected[0].fee().raw(), fee);
+
+    let block = h.extend(selected);
+    assert_eq!(block.transactions()[1].fee().raw(), fee);
+    let reward = subsidy(block.header().height)
+        .checked_add(RawCoin::from_raw(fee).unwrap())
+        .unwrap();
+    assert!(h.miner.coins.iter().any(|(coin, _)| coin.value() == reward));
+    pool.on_block_applied(&block, h.chain.store(), h.chain.params())
+        .unwrap();
+    assert!(pool.is_empty());
 }
 
 #[test]

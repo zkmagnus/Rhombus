@@ -42,16 +42,17 @@ pub const POW_SOLUTION_LEN: usize = 32;
 /// Most transactions a block may carry. Provisional.
 pub const MAX_BLOCK_TRANSACTIONS: usize = 512;
 
-/// Initial block reward: 25 BUS.
+/// Initial block reward: 25 coins.
 pub const INITIAL_EMISSION: u64 = 25 * RAWCOIN;
-/// Permanent tail reward: 0.25 BUS.
+/// Tail subsidy ceiling before the per-block fee offset: 0.25 coins.
 pub const TAIL_EMISSION: u64 = RAWCOIN / 4;
 /// Last block paid the initial reward; the tail starts at height 525,601.
 pub const TAIL_HEIGHT: u64 = 525_600;
 /// Total initial-reward issuance through [`TAIL_HEIGHT`], excluding fees.
 pub const TARGET_MINED: u64 = 13_140_000 * RAWCOIN;
 
-/// The block subsidy at `height`. Genesis pays nothing.
+/// Scheduled subsidy at `height`, before the tail fee offset. Genesis pays nothing.
+/// [`crate::fee::net_issuance`] computes the actual newly issued amount.
 pub fn subsidy(height: u32) -> RawCoin {
     if height == 0 {
         return RawCoin::ZERO;

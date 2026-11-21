@@ -381,7 +381,9 @@ impl Validator<'_> {
         rng: &mut (impl RngCore + CryptoRng),
         authorization_checked: bool,
     ) -> Result<CommitmentTree> {
-        let batch = self.queue_block(block)?;
+        // Shape bounds allocations and rejects duplicate nullifiers before
+        // consulting state. Fees and authorization come after state checks.
+        block_shape(block)?;
         let anchors: Vec<_> = block
             .transactions()
             .iter()
@@ -403,7 +405,11 @@ impl Validator<'_> {
             None => {}
         }
         if !authorization_checked {
-            batch.verify(self.vk, rng)?;
+            self.queue_block(block)?.verify(self.vk, rng)?;
+        } else {
+            // A token skips only expensive authorization, not the current
+            // shape, state or fee rules.
+            block_plan(block)?;
         }
         let mut tree = store.tree()?;
         for tx in tree_transactions(block)? {
@@ -436,6 +442,21 @@ fn child_chainwork(store: &Store, header: &BlockHeader, target: Target) -> Resul
 
 /// Splits the block and computes the mint the coinbase must carry.
 fn block_plan(block: &Block) -> Result<(&Transaction, &[Transaction], RawCoin)> {
+    let (coinbase, transfers) = block_shape(block)?;
+    coinbase.check_fee()?;
+    for tx in transfers {
+        tx.check_fee()?;
+    }
+    let mint = block_mint(
+        block.header().height,
+        transfers.iter().map(Transaction::fee),
+    )?;
+    protocol::validate::coinbase_balance(mint)?;
+    Ok((coinbase, transfers, mint))
+}
+
+/// Checks bounded transaction shapes without fees, signatures or proofs.
+fn block_shape(block: &Block) -> Result<(&Transaction, &[Transaction])> {
     let txs = block.transactions();
     if txs.is_empty() || txs.len() > MAX_BLOCK_TRANSACTIONS {
         return Err(Error::InvalidBlock("transaction count out of range"));
@@ -454,17 +475,24 @@ fn block_plan(block: &Block) -> Result<(&Transaction, &[Transaction], RawCoin)> 
         ));
     }
     let transfers = &txs[1..];
-    let mint = block_mint(
-        block.header().height,
-        transfers.iter().map(Transaction::fee),
-    )?;
-    protocol::validate::coinbase_balance(mint)?;
     if coinbase.actions().len() != 2 {
         return Err(Error::InvalidBlock(
             "coinbase must create exactly two states",
         ));
     }
-    Ok((coinbase, transfers, mint))
+    tx_validate::check_coinbase_shape(coinbase)?;
+    let mut seen = BTreeSet::new();
+    for tx in txs {
+        if tx.kind() == protocol::consensus::TRANSFER_KIND {
+            tx_validate::check_transfer_shape(tx)?;
+        }
+        for nf in tx.nullifiers() {
+            if !seen.insert(*nf) {
+                return Err(Error::InvalidBlock("nullifier already spent"));
+            }
+        }
+    }
+    Ok((coinbase, transfers))
 }
 
 /// One block's signatures and proofs, verified together at the end, and

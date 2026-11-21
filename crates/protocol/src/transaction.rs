@@ -33,7 +33,7 @@ use crate::nullifier::Nullifier;
 use crate::Result;
 
 /// Fixed transaction header length, excluding actions, proof, and signature.
-const TRANSACTION_HEADER_LEN: usize = 1 + 1 + 32 + 8 + 1;
+pub const TRANSACTION_HEADER_LEN: usize = 1 + 1 + 32 + 8 + 1;
 
 /// The root of the coin commitment tree a transaction spends against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,6 +109,40 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    /// Checks the fixed header and returns this action class's encoded length.
+    /// Does not decode points, allocate action storage, or verify authorization.
+    /// Additional bytes after the header are ignored.
+    ///
+    /// # Errors
+    /// Rejects a truncated header, an unknown version or kind, and an action
+    /// count outside the consensus whitelist.
+    pub fn precheck_header(header: &[u8]) -> Result<usize> {
+        let mut r = Reader::new(header);
+        let version = r.take_u8()?;
+        let kind = r.take_u8()?;
+        if version != TX_VERSION || (kind != TRANSFER_KIND && kind != COINBASE_KIND) {
+            return Err(crate::Error::Malformed("unknown transaction kind"));
+        }
+        // Anchor and fee are decoded only after the cheap shape/length checks.
+        r.take(32 + 8)?;
+        Self::encoded_len_for_actions(usize::from(r.take_u8()?))
+    }
+
+    /// Checks a complete transaction's exact size before decoding its fields.
+    /// Does not establish that its structure or authorization is valid.
+    ///
+    /// # Errors
+    /// Rejects an invalid fixed header or a length different from the exact
+    /// canonical length declared by that header's action count.
+    pub fn precheck_bytes(bytes: &[u8]) -> Result<()> {
+        if bytes.len() != Self::precheck_header(bytes)? {
+            return Err(crate::Error::Malformed(
+                "transaction length does not match action count",
+            ));
+        }
+        Ok(())
+    }
+
     /// Exact encoded size for a transaction with an allowed action class.
     /// Includes the four-byte proof envelope marker and all signatures.
     ///
@@ -139,20 +173,27 @@ impl Transaction {
         self.to_vec().len()
     }
 
-    /// Checks that a transfer pays its encoded size and a coinbase pays zero.
+    /// Checks the minimum canonical encoded-size fee; a coinbase must pay zero.
+    /// Shape validation must check the action count and proof length separately.
+    /// The minimum is derived from the canonical class size without serializing.
     pub fn check_fee(&self) -> Result<()> {
-        let required = if self.kind == COINBASE_KIND {
-            crate::amount::RawCoin::ZERO
-        } else {
-            crate::fee::fee_for_len(self.encoded_len())?
-        };
-        if self.fee == required {
-            Ok(())
-        } else {
-            Err(crate::Error::InvalidTransaction(
-                "fee does not match transaction size",
-            ))
+        if self.kind == COINBASE_KIND {
+            return if self.fee == crate::amount::RawCoin::ZERO {
+                Ok(())
+            } else {
+                Err(crate::Error::InvalidTransaction(
+                    "coinbase fee must be zero",
+                ))
+            };
         }
+        let minimum = Self::default_fee_for_actions(self.actions.len())?;
+        if self.fee < minimum {
+            return Err(crate::Error::InvalidTransaction(
+                "fee is below transaction minimum",
+            ));
+        }
+        self.fee.to_i64()?;
+        Ok(())
     }
 
     /// Assembles a transaction using an action proof envelope.
@@ -363,6 +404,14 @@ fn write_header(
 }
 
 impl Encodable for Transaction {
+    fn from_slice(bytes: &[u8]) -> Result<Self> {
+        Self::precheck_bytes(bytes)?;
+        let mut r = Reader::new(bytes);
+        let tx = Self::read(&mut r)?;
+        r.finish()?;
+        Ok(tx)
+    }
+
     fn write(&self, w: &mut Writer) {
         write_header(
             w,
@@ -385,14 +434,22 @@ impl Encodable for Transaction {
     }
 
     fn read(r: &mut Reader<'_>) -> Result<Self> {
-        let version = r.take_u8()?;
-        let kind = r.take_u8()?;
-        if version != TX_VERSION || (kind != TRANSFER_KIND && kind != COINBASE_KIND) {
-            return Err(crate::Error::Malformed("unknown transaction kind"));
+        let header = r.take(TRANSACTION_HEADER_LEN)?;
+        let expected_len = Self::precheck_header(header)?;
+        let payload_len = expected_len
+            .checked_sub(TRANSACTION_HEADER_LEN)
+            .ok_or(crate::Error::Malformed("transaction size overflow"))?;
+        if r.remaining() < payload_len {
+            return Err(crate::Error::Malformed("unexpected end of input"));
         }
-        let anchor = Anchor::read(r)?;
-        let fee = crate::amount::RawCoin::from_raw(r.take_u64_le()?)?;
-        let count = usize::from(r.take_u8()?);
+        // Nested readers can contain subsequent transactions. Only require
+        // enough bytes for this one; its enclosing decoder owns trailing bytes.
+        let mut header = Reader::new(header);
+        let version = header.take_u8()?;
+        let kind = header.take_u8()?;
+        let anchor = Anchor::read(&mut header)?;
+        let fee = crate::amount::RawCoin::from_raw(header.take_u64_le()?)?;
+        let count = usize::from(header.take_u8()?);
         let bodies = (0..count)
             .map(|_| ActionBody::read(r))
             .collect::<Result<Vec<_>>>()?;
@@ -474,6 +531,108 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn header_precheck_accepts_exactly_the_allowed_counts_without_decoding_points() {
+        let mut header = [0xff; TRANSACTION_HEADER_LEN];
+        header[0] = TX_VERSION;
+        header[1] = TRANSFER_KIND;
+        for count in 0..=u8::MAX {
+            header[TRANSACTION_HEADER_LEN - 1] = count;
+            let result = Transaction::precheck_header(&header);
+            if crate::consensus::is_action_class(usize::from(count)) {
+                assert_eq!(
+                    result,
+                    Transaction::encoded_len_for_actions(usize::from(count))
+                );
+            } else {
+                assert_eq!(
+                    result,
+                    Err(crate::Error::InvalidTransaction(
+                        "action count is not an allowed class"
+                    ))
+                );
+                assert_eq!(
+                    Transaction::read(&mut Reader::new(&header)),
+                    Err(crate::Error::InvalidTransaction(
+                        "action count is not an allowed class"
+                    ))
+                );
+            }
+        }
+        assert_eq!(
+            Transaction::precheck_header(&header[..TRANSACTION_HEADER_LEN - 1]),
+            Err(crate::Error::Malformed("unexpected end of input"))
+        );
+        header[0] = TX_VERSION.wrapping_add(1);
+        assert_eq!(
+            Transaction::precheck_header(&header),
+            Err(crate::Error::Malformed("unknown transaction kind"))
+        );
+    }
+
+    #[test]
+    fn size_precheck_rejects_short_and_long_encodings_before_decoding_points() {
+        for class in crate::consensus::ACTION_CLASSES {
+            let tx = sample_transaction(12, class);
+            let mut bytes = tx.to_vec();
+            assert!(Transaction::precheck_bytes(&bytes).is_ok());
+            assert_eq!(Transaction::from_slice(&bytes), Ok(tx));
+            // A size allowed for another class must not pass this header.
+            bytes[TRANSACTION_HEADER_LEN - 1] = if class == 2 { 4 } else { 2 };
+            assert_eq!(
+                Transaction::from_slice(&bytes),
+                Err(crate::Error::Malformed(
+                    "transaction length does not match action count"
+                ))
+            );
+            bytes[TRANSACTION_HEADER_LEN - 1] = u8::try_from(class).unwrap();
+            // Make the anchor noncanonical: size must still fail first.
+            bytes[2..34].fill(0xff);
+            assert!(Transaction::precheck_bytes(&bytes).is_ok());
+            assert!(Transaction::from_slice(&bytes).is_err());
+
+            let short = &bytes[..bytes.len() - 1];
+            assert_eq!(
+                Transaction::from_slice(short),
+                Err(crate::Error::Malformed(
+                    "transaction length does not match action count"
+                ))
+            );
+            bytes.push(0);
+            assert_eq!(
+                Transaction::from_slice(&bytes),
+                Err(crate::Error::Malformed(
+                    "transaction length does not match action count"
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn nested_reader_checks_available_length_before_decoding_anchor() {
+        let mut header = [0xff; TRANSACTION_HEADER_LEN];
+        header[0] = TX_VERSION;
+        header[1] = TRANSFER_KIND;
+        header[TRANSACTION_HEADER_LEN - 1] = 2;
+        assert_eq!(
+            Transaction::read(&mut Reader::new(&header)),
+            Err(crate::Error::Malformed("unexpected end of input"))
+        );
+    }
+
+    #[test]
+    fn nested_reader_preserves_the_following_transaction() {
+        let first = sample_transaction(13, 2);
+        let second = sample_transaction(14, 4);
+        let mut bytes = first.to_vec();
+        bytes.extend_from_slice(&second.to_vec());
+        let mut reader = Reader::new(&bytes);
+        assert_eq!(Transaction::read(&mut reader), Ok(first));
+        assert_eq!(reader.remaining(), second.encoded_len());
+        assert_eq!(Transaction::read(&mut reader), Ok(second));
+        assert_eq!(reader.finish(), Ok(()));
+    }
+
+    #[test]
     fn default_fee_is_one_raw_unit_per_encoded_byte() {
         for actions in [2, 4, 8, 16] {
             let fee = Transaction::default_fee_for_actions(actions).unwrap();
@@ -485,12 +644,36 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn check_fee_rejects_fee_mismatch() {
-        let tx = sample_transaction(30, 2);
-        assert!(tx.check_fee().is_ok());
-        let mut altered = tx.clone();
-        altered.fee = crate::amount::RawCoin::ZERO;
-        assert!(altered.check_fee().is_err());
+    fn check_fee_requires_a_minimum_and_a_representable_binding_balance() {
+        let mut tx = sample_transaction(30, 2);
+        let minimum = tx.fee.raw();
+        assert_eq!(tx.check_fee(), Ok(()));
+        tx.fee = crate::amount::RawCoin::from_raw(minimum - 1).unwrap();
+        assert_eq!(
+            tx.check_fee(),
+            Err(crate::Error::InvalidTransaction(
+                "fee is below transaction minimum"
+            ))
+        );
+        tx.fee = crate::amount::RawCoin::from_raw(minimum + 1).unwrap();
+        assert_eq!(tx.check_fee(), Ok(()));
+        tx.fee = crate::amount::RawCoin::from_raw(u64::MAX).unwrap();
+        assert_eq!(tx.check_fee(), Err(crate::Error::RawCoinOutOfRange));
+    }
+
+    #[test]
+    fn check_fee_requires_exactly_zero_for_coinbase() {
+        let mut tx = sample_transaction(31, 2);
+        tx.kind = COINBASE_KIND;
+        tx.fee = crate::amount::RawCoin::ZERO;
+        assert_eq!(tx.check_fee(), Ok(()));
+        tx.fee = crate::amount::RawCoin::from_raw(1).unwrap();
+        assert_eq!(
+            tx.check_fee(),
+            Err(crate::Error::InvalidTransaction(
+                "coinbase fee must be zero"
+            ))
+        );
     }
 
     #[test]

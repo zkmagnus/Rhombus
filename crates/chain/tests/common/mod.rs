@@ -24,8 +24,9 @@ use protocol::amount::RawCoin as Kryptos;
 use protocol::block::{empty_header, Block, BlockHeader, PowSolution};
 use protocol::builder::{Builder, OutputInfo, SpendInfo};
 use protocol::coin::{Coin, Rho};
-use protocol::consensus::{subsidy, BranchId, BLOCK_VERSION};
+use protocol::consensus::{BranchId, BLOCK_VERSION};
 use protocol::encryption::decrypt_coin_with_ivk;
+use protocol::fee::block_mint;
 use protocol::transaction::Transaction;
 use protocol::tree_order::tree_transactions;
 use rand::SeedableRng;
@@ -183,11 +184,7 @@ impl Harness {
         txs: Vec<Transaction>,
     ) -> (Block, CommitmentTree) {
         let height = parent.height + 1;
-        let fees = txs
-            .iter()
-            .try_fold(Kryptos::ZERO, |sum, tx| sum.checked_add(tx.fee()))
-            .unwrap();
-        let credit = subsidy(height).checked_add(fees).unwrap();
+        let credit = block_mint(height, txs.iter().map(Transaction::fee)).unwrap();
         let anchor = parent.commitment_root;
         let mut b = Builder::new(anchor);
         b.add_output(OutputInfo::new(self.miner.address.clone(), credit))

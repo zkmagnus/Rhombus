@@ -10,7 +10,7 @@ use protocol::amount::RawCoin;
 use protocol::block::{empty_header, tx_root, Block, BlockHash, BlockHeader, PowSolution};
 use protocol::builder::{Builder, OutputInfo};
 use protocol::consensus::{next_height, BLOCK_VERSION};
-use protocol::fee::block_mint;
+use protocol::fee::{block_mint, net_issuance, total_fees};
 use protocol::header_tree::HeaderFrontier;
 use protocol::transaction::Transaction;
 use protocol::tree_order::tree_transactions;
@@ -166,7 +166,20 @@ impl Template {
         Ok((header, transactions))
     }
 
-    /// The coinbase mint: subsidy plus included transfer fees.
+    /// Newly issued value after the selected fees offset the tail subsidy.
+    /// Initial-emission blocks retain their full scheduled subsidy.
+    ///
+    /// # Errors
+    /// Fails if the next height or total fee cannot be represented.
+    pub fn issuance(&self) -> Result<RawCoin> {
+        Ok(net_issuance(
+            next_height(self.parent.height)?,
+            total_fees(self.transactions.iter().map(Transaction::fee))?,
+        )?)
+    }
+
+    /// The coinbase payout after fees offset the scheduled tail subsidy.
+    /// Initial-emission blocks still pay the subsidy plus all included fees.
     pub fn mint(&self) -> Result<RawCoin> {
         Ok(block_mint(
             next_height(self.parent.height)?,
@@ -505,6 +518,81 @@ mod tests {
             },
             keys.default_address().unwrap(),
         )
+    }
+
+    /// An encoded transfer for mint arithmetic, not a valid payment.
+    fn transfer_with_fee(fee: u64) -> Transaction {
+        use crypto::encoding::ENCODED_LEN;
+        use protocol::action::{ACTION_BODY_LEN, ACTION_LEN};
+        use protocol::bytes::Encodable;
+        use protocol::consensus::{TRANSFER_KIND, TX_VERSION};
+        use protocol::encryption::ENCRYPTED_COIN_VERSION;
+        use protocol::transaction::{ACTION_PROOF_MAGIC, TRANSACTION_HEADER_LEN};
+
+        let actions = 2;
+        let mut bytes = vec![0; Transaction::encoded_len_for_actions(actions).unwrap()];
+        bytes[0] = TX_VERSION;
+        bytes[1] = TRANSFER_KIND;
+        bytes[34..42].copy_from_slice(&fee.to_le_bytes());
+        bytes[TRANSACTION_HEADER_LEN - 1] = u8::try_from(actions).unwrap();
+        for index in 0..actions {
+            let encrypted_coin = TRANSACTION_HEADER_LEN + index * ACTION_BODY_LEN + 4 * ENCODED_LEN;
+            bytes[encrypted_coin] = ENCRYPTED_COIN_VERSION;
+        }
+        let proof = TRANSACTION_HEADER_LEN + actions * ACTION_LEN;
+        bytes[proof..proof + ACTION_PROOF_MAGIC.len()].copy_from_slice(ACTION_PROOF_MAGIC);
+        Transaction::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn tail_mint_uses_fees_in_place_of_subsidy_without_double_payment() {
+        use protocol::consensus::{TAIL_EMISSION, TAIL_HEIGHT};
+
+        let (mut template, _) = fixture();
+        // Only payout accounting is exercised here; no synthetic ancestry is
+        // assembled or imported into a chain.
+        template.parent.height = u32::try_from(TAIL_HEIGHT).unwrap();
+        for (fees, expected_mint, expected_issuance) in [
+            (vec![], TAIL_EMISSION, TAIL_EMISSION),
+            (vec![TAIL_EMISSION - 1], TAIL_EMISSION, 1),
+            (vec![TAIL_EMISSION], TAIL_EMISSION, 0),
+            (vec![TAIL_EMISSION + 1], TAIL_EMISSION + 1, 0),
+            (
+                vec![TAIL_EMISSION / 2, TAIL_EMISSION / 4],
+                TAIL_EMISSION,
+                TAIL_EMISSION / 4,
+            ),
+            (vec![TAIL_EMISSION / 2, TAIL_EMISSION / 2], TAIL_EMISSION, 0),
+            (
+                vec![TAIL_EMISSION / 2, TAIL_EMISSION / 2 + 1],
+                TAIL_EMISSION + 1,
+                0,
+            ),
+        ] {
+            template.transactions = fees.into_iter().map(transfer_with_fee).collect();
+            assert_eq!(template.mint().unwrap().raw(), expected_mint);
+            assert_eq!(template.issuance().unwrap().raw(), expected_issuance);
+        }
+    }
+
+    #[test]
+    fn initial_mint_keeps_the_full_subsidy_through_the_last_initial_block() {
+        use protocol::consensus::{INITIAL_EMISSION, TAIL_EMISSION, TAIL_HEIGHT};
+
+        let (mut template, _) = fixture();
+        template.parent.height = u32::try_from(TAIL_HEIGHT - 1).unwrap();
+        for fee in [0, TAIL_EMISSION - 1, TAIL_EMISSION, TAIL_EMISSION + 1] {
+            template.transactions = if fee == 0 {
+                Vec::new()
+            } else {
+                vec![transfer_with_fee(fee)]
+            };
+            assert_eq!(template.mint().unwrap().raw(), INITIAL_EMISSION + fee);
+            assert_eq!(template.issuance().unwrap().raw(), INITIAL_EMISSION);
+        }
+        template.parent.height = u32::try_from(TAIL_HEIGHT).unwrap();
+        assert_eq!(template.mint().unwrap().raw(), TAIL_EMISSION + 1);
+        assert_eq!(template.issuance().unwrap().raw(), 0);
     }
 
     #[test]

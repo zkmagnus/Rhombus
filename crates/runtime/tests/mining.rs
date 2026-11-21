@@ -119,7 +119,7 @@ async fn a_pool_mines_through_templates_and_submissions() {
     assert_eq!(info["height"], 0);
     assert_eq!(info["syncing"], false);
     assert_eq!(info["next_height"], 1);
-    assert_eq!(info["subsidy"], "2500000000", "25 BUS initial emission");
+    assert_eq!(info["subsidy"], "2500000000", "25-coin initial emission");
     let chain_info = call(addr, t, "getblockchaininfo", json!([])).await;
     assert_eq!(chain_info["amount"], "100000000");
     assert_eq!(chain_info["emission"]["decimals"], 8);

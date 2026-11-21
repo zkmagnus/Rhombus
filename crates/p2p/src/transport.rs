@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use arti_client::config::{BoolOrAuto, TorClientConfigBuilder};
 use arti_client::{BootstrapBehavior, DataStream, StreamPrefs, TorClient};
 use futures_util::StreamExt;
+use protocol::transaction::{Transaction, TRANSACTION_HEADER_LEN};
 use rand_core::{OsRng, RngCore};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, watch, Semaphore};
@@ -23,7 +24,9 @@ use tor_rtcompat::PreferredRuntime;
 
 use crate::address::NetAddr;
 use crate::codec::frame;
-use crate::message::{Message, MAX_MESSAGE_LEN};
+use crate::message::{
+    is_transaction_tag, precheck_transaction_frame_len, Message, MAX_MESSAGE_LEN,
+};
 use crate::{Error, Result};
 
 /// Application handshake deadline, allowing for onion circuit latency.
@@ -840,8 +843,34 @@ impl ConnectionReader {
         if len > MAX_MESSAGE_LEN {
             return Err(Error::TooLarge(len));
         }
+        if len == 0 {
+            return Err(protocol::Error::Malformed("unexpected end of input").into());
+        }
+        let tag = self.stream.read_u8().await?;
+        // Transaction frames have one exact size per allowed action count.
+        // Keep the tag/header on the stack until that pair is checked, rather
+        // than allocating the general block-sized message limit for a TX.
+        let mut header = [0u8; TRANSACTION_HEADER_LEN];
+        let header_len = if is_transaction_tag(tag) {
+            precheck_transaction_frame_len(len)?;
+            self.stream.read_exact(&mut header).await?;
+            let transaction_len = Transaction::precheck_header(&header)?;
+            if transaction_len.checked_add(1) != Some(len) {
+                return Err(protocol::Error::Malformed(
+                    "transaction length does not match action count",
+                )
+                .into());
+            }
+            TRANSACTION_HEADER_LEN
+        } else {
+            0
+        };
         let mut bytes = vec![0u8; len];
-        self.stream.read_exact(&mut bytes).await?;
+        let (message_tag, payload) = bytes.split_at_mut(1);
+        message_tag.copy_from_slice(&[tag]);
+        let (received_header, remaining) = payload.split_at_mut(header_len);
+        received_header.copy_from_slice(&header[..header_len]);
+        self.stream.read_exact(remaining).await?;
         let message = Message::decode(&bytes)?;
         self.received_bytes = self
             .received_bytes
@@ -1118,5 +1147,120 @@ mod tests {
         let (_, mut reader) = split(server);
         client.write_all(&u32::MAX.to_le_bytes()).await.unwrap();
         assert!(matches!(reader.recv().await, Err(Error::TooLarge(_))));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transaction_frame_sizes_are_rejected_before_reading_the_header() {
+        use crate::message::tests::sample_transaction;
+
+        let transaction = sample_transaction(2);
+        for message in [
+            Message::Tx(Box::new(transaction.clone())),
+            Message::StemTx(Box::new(transaction.clone())),
+        ] {
+            let correct_len = message.encode().len();
+            for len in [1, correct_len - 1, correct_len + 1, MAX_MESSAGE_LEN] {
+                let (mut client, server) = tokio::io::duplex(64);
+                let (_, mut reader) = split(server);
+                client
+                    .write_all(&u32::try_from(len).unwrap().to_le_bytes())
+                    .await
+                    .unwrap();
+                client.write_all(&[message.tag()]).await.unwrap();
+                let result = tokio::time::timeout(Duration::from_secs(1), reader.recv())
+                    .await
+                    .expect("impossible TX sizes must fail without waiting for the header");
+                assert!(matches!(
+                    result,
+                    Err(Error::Protocol(protocol::Error::Malformed(
+                        "transaction length does not match action count"
+                    )))
+                ));
+                assert_eq!(reader.received_bytes(), 0);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transaction_action_count_is_checked_before_reading_the_body() {
+        use crate::message::tests::sample_transaction;
+
+        let transaction = sample_transaction(2);
+        for message in [
+            Message::Tx(Box::new(transaction.clone())),
+            Message::StemTx(Box::new(transaction.clone())),
+        ] {
+            for actions in [0, 1, 3, 4, 17, u8::MAX] {
+                let encoded = message.encode();
+                let mut header = encoded[1..=TRANSACTION_HEADER_LEN].to_vec();
+                header[TRANSACTION_HEADER_LEN - 1] = actions;
+                let (mut client, server) = tokio::io::duplex(64);
+                let (_, mut reader) = split(server);
+                client
+                    .write_all(&u32::try_from(encoded.len()).unwrap().to_le_bytes())
+                    .await
+                    .unwrap();
+                client.write_all(&[message.tag()]).await.unwrap();
+                client.write_all(&header).await.unwrap();
+                let result = tokio::time::timeout(Duration::from_secs(1), reader.recv())
+                    .await
+                    .expect("the fixed TX header must be enough to reject a bad count/length pair");
+                if actions == 4 {
+                    assert!(matches!(
+                        result,
+                        Err(Error::Protocol(protocol::Error::Malformed(
+                            "transaction length does not match action count"
+                        )))
+                    ));
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(Error::Protocol(protocol::Error::InvalidTransaction(
+                            "action count is not an allowed class"
+                        )))
+                    ));
+                }
+                assert_eq!(reader.received_bytes(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn transaction_prechecks_preserve_consecutive_frames_and_byte_counts() {
+        use crate::message::tests::sample_transaction;
+
+        let messages = [
+            Message::Tx(Box::new(sample_transaction(2))),
+            Message::StemTx(Box::new(sample_transaction(16))),
+            Message::Ping(123),
+            Message::Verack,
+        ];
+        let wire: Vec<u8> = messages.iter().flat_map(frame).collect();
+        let expected_bytes = u64::try_from(wire.len()).unwrap();
+        let (mut client, server) = tokio::io::duplex(64);
+        let sending = tokio::spawn(async move { client.write_all(&wire).await.unwrap() });
+        let (_, mut reader) = split(server);
+        for message in messages {
+            assert_eq!(reader.recv().await.unwrap(), message);
+        }
+        sending.await.unwrap();
+        assert_eq!(reader.received_bytes(), expected_bytes);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_frames_are_rejected_without_reading_the_next_tag() {
+        let (mut client, server) = tokio::io::duplex(64);
+        let (_, mut reader) = split(server);
+        client.write_all(&0u32.to_le_bytes()).await.unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), reader.recv())
+                .await
+                .expect("an empty frame needs no payload read"),
+            Err(Error::Protocol(protocol::Error::Malformed(
+                "unexpected end of input"
+            )))
+        ));
+        client.write_all(&frame(&Message::Ping(7))).await.unwrap();
+        assert_eq!(reader.recv().await.unwrap(), Message::Ping(7));
     }
 }

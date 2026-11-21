@@ -45,8 +45,10 @@ same validated tips produce the same fork choice at every node.
 Storage layout version 1 under the new chain store marker requires the
 cumulative-work index. Opening an older database fails and asks for
 resynchronization rather than reconstructing work from untrusted header
-claims. Consensus revision 2 records the deterministic equal-work fork choice;
-revision 1 stores are refused so an earlier arrival-order choice cannot persist.
+claims. The configured consensus revision remains `1`; deterministic equal-work
+fork choice and size-based minimum transfer fees remain enabled. Stores whose
+full consensus rules digest differs are refused. This does not migrate, delete
+or rewrite operator databases.
 
 The maintained pool is fixed by configuration and contains authenticated
 reusable peers. A strict directed rule in which every pair always chooses the

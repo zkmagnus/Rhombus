@@ -5,9 +5,9 @@ use core::ops::{Add, Sub};
 
 use crate::{Error, Result};
 
-/// Number of decimal places in one BUS.
+/// Number of decimal places in one coin.
 pub const DECIMAL: u32 = 8;
-/// Smallest unit: one hundred-millionth of a BUS.
+/// Smallest unit: one hundred-millionth of a coin.
 pub const RAWCOIN: u64 = 100_000_000;
 
 /// A non-negative amount represented as a `u64`.
@@ -166,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn bus_decimal_scale_matches_rawcoin() {
+    fn decimal_scale_matches_rawcoin() {
         assert_eq!(10u64.pow(DECIMAL), RAWCOIN);
     }
 

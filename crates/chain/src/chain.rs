@@ -568,8 +568,8 @@ impl Chain {
     }
 }
 
-/// Consensus rules revision; revision 2 adds deterministic equal-work fork choice.
-pub const CONSENSUS_REVISION: u32 = 2;
+/// Consensus rules revision, kept at version 1 for the current chain profile.
+pub const CONSENSUS_REVISION: u32 = 1;
 
 /// Digest of block validity and fork-choice rules:
 /// [`CONSENSUS_REVISION`], every consensus parameter, the genesis branch,
@@ -579,6 +579,15 @@ pub fn rules_digest(params: &ChainParams, vk: &VerifyingKey) -> [u8; 32] {
 }
 
 fn rules_digest_for_revision(params: &ChainParams, vk: &VerifyingKey, revision: u32) -> [u8; 32] {
+    rules_digest_with_tail_fee_offset(params, vk, revision, true)
+}
+
+fn rules_digest_with_tail_fee_offset(
+    params: &ChainParams,
+    vk: &VerifyingKey,
+    revision: u32,
+    tail_fee_offset: bool,
+) -> [u8; 32] {
     let mut w = Writer::default();
     w.put(&revision.to_le_bytes());
     w.put(b"kryptos-header-v1-state-roots-tx-merkle-body-merkle-parent-header-mmr");
@@ -609,6 +618,11 @@ fn rules_digest_for_revision(params: &ChainParams, vk: &VerifyingKey, revision: 
     w.put(&protocol::consensus::TAIL_EMISSION.to_le_bytes());
     w.put(&protocol::consensus::TAIL_HEIGHT.to_le_bytes());
     w.put(&protocol::consensus::TARGET_MINED.to_le_bytes());
+    // Bind the payout formula as well as its numeric parameters. The public
+    // revision remains 1, but additive-tail history is a different profile.
+    if tail_fee_offset {
+        w.put(b"kryptos-tail-fee-offset");
+    }
     w.put(
         &u64::try_from(params.randomx_key.len())
             .unwrap_or(u64::MAX)
@@ -903,37 +917,82 @@ mod tests {
     }
 
     #[test]
-    fn reopening_refuses_the_previous_first_seen_fork_choice_profile_without_mutation() {
+    fn rules_digest_binds_tail_fee_offset_while_revision_stays_one() {
+        assert_eq!(CONSENSUS_REVISION, 1);
+        let params = ChainParams::test();
+        let vk = VerifyingKey::build().unwrap();
+        assert_eq!(
+            rules_digest(&params, &vk),
+            rules_digest_with_tail_fee_offset(&params, &vk, 1, true)
+        );
+        assert_ne!(
+            rules_digest(&params, &vk),
+            rules_digest_with_tail_fee_offset(&params, &vk, 1, false)
+        );
+    }
+
+    #[test]
+    fn reopening_refuses_different_revisions_without_mutation() {
+        assert_eq!(CONSENSUS_REVISION, 1);
+        for revision in [2, 3] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("chain.redb");
+            let params = ChainParams::mainnet();
+            let chain = Chain::new(
+                Store::open(&path).unwrap(),
+                params,
+                VerifyingKey::build().unwrap(),
+            )
+            .unwrap();
+            let previous_digest =
+                rules_digest_for_revision(&params, chain.verifying_key(), revision);
+            assert_ne!(previous_digest, chain.rules_digest);
+
+            // Model persisted history without generating proofs: admission must
+            // reject the old profile before reading or rewriting its block state.
+            let first = empty_state_block(&chain, chain.tip().unwrap().hash, 1);
+            let tree = chain.store.tree().unwrap();
+            chain.store.apply(&first, &tree, &[0; 32]).unwrap();
+            let original_tip = chain.tip().unwrap();
+            chain.store.set_rules_digest(&previous_digest).unwrap();
+            drop(chain);
+
+            let store = Store::open(&path).unwrap();
+            assert!(matches!(
+                Chain::new(store.clone(), params, VerifyingKey::build().unwrap()),
+                Err(Error::RulesMismatch)
+            ));
+            assert_eq!(store.rules_digest().unwrap(), Some(previous_digest));
+            assert_eq!(store.tip().unwrap(), Some(original_tip));
+            assert_eq!(store.block(&first.hash()).unwrap(), Some(first));
+        }
+    }
+
+    #[test]
+    fn reopening_accepts_the_current_revision_one_profile() {
+        assert_eq!(CONSENSUS_REVISION, 1);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("chain.redb");
-        // Mainnet parameters did not otherwise change with fork choice. The
-        // explicit revision must distinguish even these profiles.
-        let params = ChainParams::mainnet();
+        let params = ChainParams::test();
         let chain = Chain::new(
             Store::open(&path).unwrap(),
             params,
             VerifyingKey::build().unwrap(),
         )
         .unwrap();
-        let previous_digest = rules_digest_for_revision(&params, chain.verifying_key(), 1);
-        assert_ne!(previous_digest, chain.rules_digest);
-
-        // Model persisted history without generating proofs: admission must
-        // reject the old profile before reading or rewriting its block state.
-        let first = empty_state_block(&chain, chain.tip().unwrap().hash, 1);
-        let tree = chain.store.tree().unwrap();
-        chain.store.apply(&first, &tree, &[0; 32]).unwrap();
+        let expected = rules_digest_for_revision(&params, chain.verifying_key(), 1);
+        assert_eq!(rules_digest(&params, chain.verifying_key()), expected);
+        assert_eq!(chain.store.rules_digest().unwrap(), Some(expected));
         let original_tip = chain.tip().unwrap();
-        chain.store.set_rules_digest(&previous_digest).unwrap();
         drop(chain);
 
-        let store = Store::open(&path).unwrap();
-        assert!(matches!(
-            Chain::new(store.clone(), params, VerifyingKey::build().unwrap()),
-            Err(Error::RulesMismatch)
-        ));
-        assert_eq!(store.rules_digest().unwrap(), Some(previous_digest));
-        assert_eq!(store.tip().unwrap(), Some(original_tip));
-        assert_eq!(store.block(&first.hash()).unwrap(), Some(first));
+        let reopened = Chain::new(
+            Store::open(&path).unwrap(),
+            params,
+            VerifyingKey::build().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reopened.store.rules_digest().unwrap(), Some(expected));
+        assert_eq!(reopened.tip().unwrap(), original_tip);
     }
 }

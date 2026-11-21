@@ -302,7 +302,7 @@ pub struct MiningInfo {
     pub syncing: bool,
     /// The next block's target, compact form.
     pub next_target: u32,
-    /// The next block's subsidy, in smallest units.
+    /// The selected next block's new issuance after fee offsets, in smallest units.
     pub subsidy: u64,
     /// Pooled transactions.
     pub mempool: usize,
@@ -3398,13 +3398,12 @@ impl Node {
     fn mining_info(&mut self) -> Result<MiningInfo> {
         let template = self.template()?;
         let tip = self.chain.tip()?;
-        let next = next_height(tip.height)?;
         Ok(MiningInfo {
             height: tip.height,
             hash: tip.hash,
             syncing: self.is_syncing(),
             next_target: template.next_target()?.to_compact(),
-            subsidy: protocol::consensus::subsidy(next).raw(),
+            subsidy: template.issuance()?.raw(),
             mempool: self.mempool.len(),
             work_per_second: work_per_second(&template.recent)?.to_string(),
         })

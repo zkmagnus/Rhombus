@@ -125,6 +125,7 @@ impl Mempool {
         vk: &VerifyingKey,
         rng: &mut (impl RngCore + CryptoRng),
     ) -> Result<TxId> {
+        protocol::validate::check_transfer_shape(&tx)?;
         let branch = self.sync_branch(store, params)?;
         let txid = tx.txid();
         if self.contains(&txid) {
@@ -133,8 +134,8 @@ impl Mempool {
         if self.len() >= self.capacity {
             return Err(Error::Rejected(Rejection::Full));
         }
-        protocol::validate::check_structure(&tx)?;
         self.check_state(&tx, store, params)?;
+        tx.check_fee()?;
         protocol::validate::verify_transfer(&tx, branch, vk, rng)?;
         self.admit(txid, tx);
         Ok(txid)

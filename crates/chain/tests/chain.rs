@@ -21,7 +21,7 @@ use protocol::amount::RawCoin;
 use protocol::block::{empty_header, Block, PowSolution};
 use protocol::builder::{Builder, OutputInfo, SpendInfo};
 use protocol::bytes::Encodable;
-use protocol::consensus::{subsidy, BranchId};
+use protocol::consensus::{subsidy, BranchId, INITIAL_EMISSION, TAIL_EMISSION, TAIL_HEIGHT};
 use protocol::transaction::Transaction;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -107,7 +107,108 @@ fn public_fee_is_encoded_and_paid_into_the_coinbase() {
 }
 
 #[test]
-fn block_rejects_transfer_with_incorrect_declared_fee() {
+fn tail_fees_replace_subsidy_and_reject_legacy_additive_coinbases() {
+    let mut h = Harness::new(10_701);
+    h.extend(Vec::new());
+    let parent = h.tip_header();
+    let funded = h.miner.clone_for_test(0);
+    let params = *h.chain.params();
+    let vk = proving_key().verifying_key();
+    let last_initial = u32::try_from(TAIL_HEIGHT).unwrap();
+    let first_tail = last_initial + 1;
+    let cases = [
+        (
+            last_initial,
+            TAIL_EMISSION / 2,
+            INITIAL_EMISSION + TAIL_EMISSION / 2,
+        ),
+        (first_tail, 0, TAIL_EMISSION),
+        (first_tail, TAIL_EMISSION / 2, TAIL_EMISSION),
+        (first_tail, TAIL_EMISSION, TAIL_EMISSION),
+        (first_tail, TAIL_EMISSION + 1, TAIL_EMISSION + 1),
+    ];
+
+    for (height, fee, expected_credit) in cases {
+        let branch = params.branch_at(height);
+        let fee = RawCoin::from_raw(fee).unwrap();
+        let transfers = if fee == RawCoin::ZERO {
+            Vec::new()
+        } else {
+            assert!(fee > Transaction::default_fee_for_actions(2).unwrap());
+            let (coin, position) = funded.coins[0].clone();
+            let value = coin.value().checked_sub(fee).unwrap();
+            let path = funded.tree.path(position).unwrap();
+            let mut builder = Builder::new(parent.commitment_root);
+            builder
+                .add_spend(SpendInfo::new(funded.sk.clone(), coin, path))
+                .unwrap();
+            builder
+                .add_output(OutputInfo::new(funded.address.clone(), value))
+                .unwrap();
+            vec![builder
+                .build_with_fee(fee, proving_key(), branch, &mut h.rng)
+                .unwrap()]
+        };
+        let credit = RawCoin::from_raw(expected_credit).unwrap();
+        let mut builder = Builder::new(parent.commitment_root);
+        builder
+            .add_output(OutputInfo::new(h.miner.address.clone(), credit))
+            .unwrap();
+        let coinbase = builder
+            .build_coinbase(proving_key(), credit, branch, &mut h.rng)
+            .unwrap();
+        let mut transactions = vec![coinbase];
+        transactions.extend(transfers.iter().cloned());
+
+        // The height selects the reward rules for this stateless authorization
+        // check. This synthetic header does not claim a mined or imported
+        // 525,601-block ancestry, nor does it skip state checks in production.
+        let mut header = empty_header(height, parent.hash(), parent.commitment_root);
+        header.tx_root = protocol::block::tx_root(transactions.iter().map(Transaction::txid));
+        header.body_root = protocol::body_tree::body_root(&transactions).unwrap();
+        let block = Block::new(header.clone(), transactions);
+        let validator = chain::validate::Validator {
+            params: &params,
+            pow: h.chain.pow(),
+            vk: &vk,
+            chain_id: h.chain.chain_id(),
+            now: parent.timestamp,
+        };
+        validator.check_authorization(&block, &mut h.rng).unwrap();
+
+        if height == first_tail && fee != RawCoin::ZERO {
+            let additive_credit = subsidy(height).checked_add(fee).unwrap();
+            let mut builder = Builder::new(parent.commitment_root);
+            builder
+                .add_output(OutputInfo::new(h.miner.address.clone(), additive_credit))
+                .unwrap();
+            let additive_coinbase = builder
+                .build_coinbase(proving_key(), additive_credit, branch, &mut h.rng)
+                .unwrap();
+            // It is a valid proof/signature for the former additive amount;
+            // rejection below must come from the validator's expected credit.
+            protocol::validate::verify_coinbase(
+                &additive_coinbase,
+                additive_credit,
+                branch,
+                &vk,
+                &mut h.rng,
+            )
+            .unwrap();
+            let mut transactions = vec![additive_coinbase];
+            transactions.extend(transfers);
+            header.tx_root = protocol::block::tx_root(transactions.iter().map(Transaction::txid));
+            header.body_root = protocol::body_tree::body_root(&transactions).unwrap();
+            assert!(matches!(
+                validator.check_authorization(&Block::new(header, transactions), &mut h.rng),
+                Err(Error::Crypto(crypto::Error::InvalidSignature))
+            ));
+        }
+    }
+}
+
+#[test]
+fn block_rejects_transfer_below_the_minimum_fee_before_signatures() {
     let mut h = Harness::new(104);
     h.extend(Vec::new());
     let parent = h.tip_header();
@@ -117,13 +218,13 @@ fn block_rejects_transfer_with_incorrect_declared_fee() {
     let tx = spend_first_coin_with_fee(&mut h, &spending_wallet, &recipient.address, 1_000, fee);
     let mut bytes = tx.to_vec();
     let fee_offset = 1 + 1 + 32;
-    bytes[fee_offset..fee_offset + 8].copy_from_slice(&(fee + 1).to_le_bytes());
+    bytes[fee_offset..fee_offset + 8].copy_from_slice(&(fee - 1).to_le_bytes());
     let tampered = Transaction::from_slice(&bytes).unwrap();
     let block = h.make_block(&parent, vec![tampered]);
     assert!(matches!(
         h.import(&block),
         Err(Error::Protocol(protocol::Error::InvalidTransaction(
-            "fee does not match transaction size"
+            "fee is below transaction minimum"
         )))
     ));
 }
@@ -784,7 +885,7 @@ fn coinbase_with_nonzero_fee_is_rejected_before_binding_verification() {
     assert!(matches!(
         h.import(&block),
         Err(Error::Protocol(protocol::Error::InvalidTransaction(
-            "fee does not match transaction size",
+            "coinbase fee must be zero",
         )))
     ));
 }
